@@ -2,6 +2,7 @@ package com.keshav.capturesposed
 
 import android.os.Build
 import android.util.Log
+import com.keshav.capturesposed.hookers.DisplayDiagnosticHooker
 import com.keshav.capturesposed.hookers.DisplayManagerHooker
 import com.keshav.capturesposed.hookers.ScreenCaptureCallbackHooker
 import com.keshav.capturesposed.hookers.ScreenRecordingCallbackControllerHooker
@@ -30,6 +31,9 @@ class CaptureSposed : XposedModule() {
             // (e.g. Paytm's bundled native lib -> nIsMirroring()), which triggers
             // error 70015 when a built-in screen recorder creates an extra display.
             DisplayManagerHooker.hook(param, module)
+
+            // DIAGNOSTIC: log which display query/event methods Paytm calls while recording.
+            DisplayDiagnosticHooker.hook(param, module)
 
             // Android 14+ (API 34): Hook Activity.ScreenCaptureCallback mechanism
             // This blocks apps like Paytm from detecting screen recording via
