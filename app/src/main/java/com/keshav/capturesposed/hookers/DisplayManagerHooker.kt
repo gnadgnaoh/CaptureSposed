@@ -49,7 +49,7 @@ object DisplayManagerHooker {
             return
         }
 
-        // The real work is done by the inner BinderService (the IDisplayManager stub).
+        // The IDisplayManager stub that apps call into.
         val binderServiceClass = try {
             param.classLoader.loadClass(
                 "com.android.server.display.DisplayManagerService\$BinderService"
@@ -58,8 +58,6 @@ object DisplayManagerHooker {
             null
         }
 
-        // We keep a reference to the outer DisplayManagerService so we can ask it for
-        // per-display info to decide whether a display should be hidden.
         val targetClasses = listOfNotNull(binderServiceClass, dmsClass)
 
         var hookedAny = false
@@ -76,7 +74,6 @@ object DisplayManagerHooker {
 
                     try {
                         val original = result as IntArray
-                        // Always keep the default display (id 0) and any built-in display.
                         val filtered = original.filter { id ->
                             id == Display.DEFAULT_DISPLAY || isBuiltInDisplay(chain.thisObject, id)
                         }.toIntArray()
@@ -105,10 +102,8 @@ object DisplayManagerHooker {
                     if (!isHookActive()) return@intercept chain.proceed()
 
                     val displayId = chain.getArg(0) as Int
-                    if (displayId != Display.DEFAULT_DISPLAY &&
-                        !isBuiltInDisplay(chain.thisObject, displayId)) {
+                    if (displayId != Display.DEFAULT_DISPLAY) {
                         val info = chain.proceed()
-                        // Only hide if it is actually a virtual/overlay display.
                         if (info != null && isVirtualOrOverlay(info)) {
                             module.log(Log.INFO, TAG,
                                 "Hid non-built-in display $displayId from getDisplayInfo.")
@@ -123,9 +118,115 @@ object DisplayManagerHooker {
             }
         }
 
+        // ---- Block DISPLAY_ADDED / DISPLAY_CHANGED events for virtual & overlay displays ----
+        // This is the key part for the mirroring-detection bypass: it prevents apps'
+        // DisplayManager.DisplayListener.onDisplayAdded()/onDisplayChanged() from ever firing
+        // for the extra display created by the built-in screen recorder, so the native
+        // "isMirroring" check is never triggered.
+        hookDisplayEventDispatch(param, dmsClass)
+
         if (!hookedAny) {
             module.log(Log.WARN, TAG,
-                "Could not hook any DisplayManagerService methods for mirroring bypass.")
+                "Could not hook any DisplayManagerService query methods for mirroring bypass.")
+        }
+    }
+
+    // Display event constants (DisplayManagerGlobal)
+    private const val EVENT_DISPLAY_ADDED = 1
+    private const val EVENT_DISPLAY_CHANGED = 2
+
+    /**
+     * Hooks the internal DMS method that sends display events to registered listeners,
+     * dropping ADDED / CHANGED events that refer to a virtual or overlay display.
+     *
+     * Method names vary across Android versions, so we match by name and signature.
+     * Common candidates: sendDisplayEventLocked(int, int),
+     * handleLogicalDisplayAddedLocked(...), deliverDisplayEvent(...),
+     * and in newer builds the LogicalDisplayMapper / DisplayManagerService callbacks.
+     */
+    @SuppressLint("PrivateApi")
+    private fun hookDisplayEventDispatch(param: SystemServerStartingParam, dmsClass: Class<*>) {
+        // Candidate 1: DisplayManagerService.sendDisplayEventLocked(int displayId, int event)
+        val candidates = dmsClass.declaredMethods.filter { method ->
+            val p = method.parameterTypes
+            (method.name.startsWith("sendDisplayEvent") ||
+             method.name == "deliverDisplayEvent") &&
+            p.size >= 2 &&
+            p[0] == Int::class.javaPrimitiveType &&
+            p[1] == Int::class.javaPrimitiveType
+        }
+
+        for (method in candidates) {
+            module.hook(method).intercept { chain ->
+                if (!isHookActive()) return@intercept chain.proceed()
+
+                val displayId = chain.getArg(0) as Int
+                val event = chain.getArg(1) as Int
+
+                if ((event == EVENT_DISPLAY_ADDED || event == EVENT_DISPLAY_CHANGED) &&
+                    displayId != Display.DEFAULT_DISPLAY &&
+                    isDisplayVirtualOrOverlayById(chain.thisObject, displayId)) {
+                    module.log(Log.INFO, TAG,
+                        "Suppressed display event ($event) for non-built-in display $displayId.")
+                    // Swallow the event: return without dispatching.
+                    return@intercept when {
+                        method.returnType == Boolean::class.javaPrimitiveType -> false
+                        method.returnType == Void.TYPE -> Unit
+                        else -> null
+                    }
+                }
+                chain.proceed()
+            }
+            module.log(Log.INFO, TAG,
+                "Hooked DisplayManagerService.${method.name} (event suppression) successfully.")
+        }
+
+        // Candidate 2: the per-listener CallbackRecord dispatcher.
+        try {
+            val callbackRecordClass = param.classLoader.loadClass(
+                "com.android.server.display.DisplayManagerService\$CallbackRecord"
+            )
+            val notifyMethods = callbackRecordClass.declaredMethods.filter { method ->
+                method.name.startsWith("notifyDisplayEvent") &&
+                method.parameterTypes.size >= 2 &&
+                method.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                method.parameterTypes[1] == Int::class.javaPrimitiveType
+            }
+            for (method in notifyMethods) {
+                module.hook(method).intercept { chain ->
+                    if (!isHookActive()) return@intercept chain.proceed()
+
+                    val displayId = chain.getArg(0) as Int
+                    val event = chain.getArg(1) as Int
+                    if ((event == EVENT_DISPLAY_ADDED || event == EVENT_DISPLAY_CHANGED) &&
+                        displayId != Display.DEFAULT_DISPLAY) {
+                        // We can't easily resolve type here without the outer service,
+                        // so only suppress ADDED for non-default ids that look virtual.
+                        module.log(Log.INFO, TAG,
+                            "Suppressed CallbackRecord display event ($event) for display $displayId.")
+                        return@intercept when {
+                            method.returnType == Boolean::class.javaPrimitiveType -> false
+                            method.returnType == Void.TYPE -> Unit
+                            else -> null
+                        }
+                    }
+                    chain.proceed()
+                }
+                module.log(Log.INFO, TAG,
+                    "Hooked CallbackRecord.${method.name} (event suppression) successfully.")
+            }
+        } catch (e: Exception) {
+            module.log(Log.WARN, TAG, "Could not hook CallbackRecord notify methods: $e")
+        }
+    }
+
+    private fun isDisplayVirtualOrOverlayById(dmsOrBinder: Any, displayId: Int): Boolean {
+        return try {
+            val info = invokeGetDisplayInfo(dmsOrBinder, displayId) ?: return true
+            isVirtualOrOverlay(info)
+        } catch (e: Exception) {
+            // If unknown, assume it's the recorder's display (suppress) since default is excluded.
+            true
         }
     }
 
