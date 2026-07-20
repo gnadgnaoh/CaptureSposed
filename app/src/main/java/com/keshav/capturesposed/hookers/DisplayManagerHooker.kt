@@ -146,6 +146,7 @@ object DisplayManagerHooker {
      */
     @SuppressLint("PrivateApi")
     private fun hookDisplayEventDispatch(param: SystemServerStartingParam, dmsClass: Class<*>) {
+        val module = this.module!!
         // Candidate 1: DisplayManagerService.sendDisplayEventLocked(int displayId, int event)
         val candidates = dmsClass.declaredMethods.filter { method ->
             val p = method.parameterTypes
