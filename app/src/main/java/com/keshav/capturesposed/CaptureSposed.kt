@@ -18,6 +18,11 @@ class CaptureSposed : XposedModule() {
         module = this
     }
 
+    // All hooks live in system_server. We intentionally do NOT hook individual app
+    // processes (e.g. Paytm): hooking apps directly proved crash-prone, and it is
+    // unnecessary because neutralising detection at the framework level means an app's
+    // own anti-capture logic (such as Paytm's checkAndDisableScreenRecording) is never
+    // triggered in the first place.
     override fun onSystemServerStarting(param: SystemServerStartingParam) {
         super.onSystemServerStarting(param)
 
